@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use bisection::{bisect_left, bisect_right};
 use itertools::Itertools;
 use std::{
