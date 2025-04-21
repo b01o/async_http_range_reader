@@ -26,7 +26,7 @@ use reqwest::header::HeaderMap;
 use reqwest::{Response, Url};
 use sparse_range::SparseRange;
 use std::{
-    io::{self, ErrorKind, SeekFrom},
+    io::{self, SeekFrom},
     ops::Range,
     pin::Pin,
     sync::Arc,
@@ -38,6 +38,7 @@ use tokio::{
     sync::{watch, Mutex},
 };
 use tokio_stream::wrappers::WatchStream;
+// use tokio_util::bytes;
 use tokio_util::sync::PollSender;
 use tracing::{info_span, Instrument};
 
@@ -83,11 +84,26 @@ pub struct AsyncHttpRangeReader {
     len: u64,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct StreamerState {
     resident_range: SparseRange,
-    requested_ranges: Vec<Range<u64>>,
+    // requested_ranges: Vec<Range<u64>>,
+    requested_ranges: SparseRange,
+    requested_time: usize,
+    backward_memory_limit: u64,
     error: Option<AsyncHttpRangeReaderError>,
+}
+
+impl Default for StreamerState {
+    fn default() -> Self {
+        Self {
+            resident_range: Default::default(),
+            requested_ranges: Default::default(),
+            requested_time: 0,
+            backward_memory_limit: 20 * 1024 * 1024,
+            error: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -135,6 +151,11 @@ fn error_for_status(response: reqwest::Response) -> reqwest_middleware::Result<R
     response
         .error_for_status()
         .map_err(reqwest_middleware::Error::Reqwest)
+}
+
+struct PositionResponse {
+    start_position: u64,
+    response: Response,
 }
 
 impl AsyncHttpRangeReader {
@@ -259,7 +280,7 @@ impl AsyncHttpRangeReader {
         let mut streamer_state = StreamerState::default();
         streamer_state
             .requested_ranges
-            .push(complete_length - (finish - start)..complete_length);
+            .update(complete_length - (finish - start)..complete_length);
 
         let reader = Self {
             len: memory_map_slice.len() as u64,
@@ -380,7 +401,11 @@ impl AsyncHttpRangeReader {
         if let Some(Some(new_state)) = inner.streamer_state_rx.next().now_or_never() {
             inner.streamer_state = new_state;
         }
-        inner.streamer_state.requested_ranges.clone()
+        inner
+            .streamer_state
+            .requested_ranges
+            .covered_ranges()
+            .collect()
     }
 
     /// Prefetches a range of bytes from the remote. When specifying a large range this can
@@ -407,6 +432,15 @@ impl AsyncHttpRangeReader {
     pub fn len(&self) -> u64 {
         self.len
     }
+
+    /// Returns the currently cached size of the stream in bytes.
+    pub async fn cached_size(&self) -> u64 {
+        self.inner.lock().await.streamer_state.resident_range.len()
+    }
+
+    pub async fn requested_time(&self) -> usize {
+        self.inner.lock().await.streamer_state.requested_time
+    }
 }
 
 /// A task that will download parts from the remote archive and "send" them to the frontend as they
@@ -427,12 +461,17 @@ async fn run_streamer(
         // Add the initial range to the state
         state
             .requested_ranges
-            .push(response_start..memory_map.len() as u64);
+            .update(response_start..memory_map.len() as u64);
+        state.requested_time += 1;
 
+        let mut pr = PositionResponse {
+            start_position: response_start,
+            response,
+        };
         // Stream the initial data in memory
         if !stream_response(
-            response,
-            response_start,
+            &mut pr,
+            memory_map.len() as u64 - 1,
             &mut memory_map,
             &mut state_tx,
             &mut state,
@@ -442,6 +481,9 @@ async fn run_streamer(
             return;
         }
     }
+
+    // save the response and its start position, reuse it later if possible
+    let mut resp_opt: Option<PositionResponse> = None;
 
     // Listen for any new incoming requests
     'outer: loop {
@@ -463,45 +505,54 @@ async fn run_streamer(
             // Update the requested ranges
             state
                 .requested_ranges
-                .push(*range.start()..*range.end() + 1);
+                .update(*range.start()..*range.end() + 1);
 
-            // Execute the request
-            let range_string = format!("bytes={}-{}", range.start(), range.end());
-            let span = info_span!("fetch_range", range = range_string.as_str());
-            let response = match client
-                .get(url.clone())
-                .header(reqwest::header::RANGE, range_string)
-                .headers(extra_headers.clone())
-                .send()
-                .instrument(span)
-                .await
-                .and_then(error_for_status)
-                .map_err(|e| std::io::Error::new(ErrorKind::Other, e))
+            if !resp_opt
+                .as_mut()
+                .is_some_and(|PositionResponse { start_position, .. }| {
+                    *start_position == *range.start()
+                })
             {
-                Err(e) => {
-                    state.error = Some(e.into());
+                state.requested_time += 1;
+                // Create a new request
+                // let range_string = format!("bytes={}-{}", range.start(), range.end());
+                let range_string = format!("bytes={}-", range.start());
+                let span = info_span!("fetch_range", range = range_string.as_str());
+                let response = match client
+                    .get(url.clone())
+                    .header(reqwest::header::RANGE, range_string)
+                    .headers(extra_headers.clone())
+                    .send()
+                    .instrument(span)
+                    .await
+                    .and_then(error_for_status)
+                    .map_err(std::io::Error::other)
+                {
+                    Err(e) => {
+                        state.error = Some(e.into());
+                        let _ = state_tx.send(state);
+                        break 'outer;
+                    }
+                    Ok(response) => response,
+                };
+
+                // If the server returns a successful, but non-206 response (e.g., 200), then it
+                // doesn't support range requests (even if the `Accept-Ranges` header is set).
+                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    state.error = Some(AsyncHttpRangeReaderError::HttpRangeRequestUnsupported);
                     let _ = state_tx.send(state);
                     break 'outer;
                 }
-                Ok(response) => response,
-            };
 
-            // If the server returns a successful, but non-206 response (e.g., 200), then it
-            // doesn't support range requests (even if the `Accept-Ranges` header is set).
-            if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                state.error = Some(AsyncHttpRangeReaderError::HttpRangeRequestUnsupported);
-                let _ = state_tx.send(state);
-                break 'outer;
+                resp_opt = Some(PositionResponse {
+                    start_position: *range.start(),
+                    response,
+                });
             }
 
-            if !stream_response(
-                response,
-                *range.start(),
-                &mut memory_map,
-                &mut state_tx,
-                &mut state,
-            )
-            .await
+            // SAFETY: We know that the response is not `None` because we just created it.
+            let pr = unsafe { resp_opt.as_mut().unwrap_unchecked() };
+            if !stream_response(pr, *range.end(), &mut memory_map, &mut state_tx, &mut state).await
             {
                 break 'outer;
             }
@@ -510,38 +561,37 @@ async fn run_streamer(
 }
 
 /// Streams the data from the specified response to the memory map updating progress in between.
+/// Reads from position `position_response.pos` until `target_end` is reached.
+/// `pos` can be larger than `target_end` if the server returns a chunk has more data than needed.
 /// Returns `true` if everything went fine, `false` if anything went wrong. The error state, if any,
 /// is stored in `state_tx` so the "frontend" will consume it.
 async fn stream_response(
-    tail_request_response: Response,
-    mut offset: u64,
+    position_response: &mut PositionResponse,
+    target_end: u64,
     memory_map: &mut MmapMut,
     state_tx: &mut Sender<StreamerState>,
     state: &mut StreamerState,
 ) -> bool {
-    let mut byte_stream = tail_request_response.bytes_stream();
-    while let Some(bytes) = byte_stream.next().await {
-        let bytes = match bytes {
+    let pr = position_response;
+    let start_position = pr.start_position;
+    while pr.start_position < target_end {
+        let bytes = match pr.response.chunk().await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
             Err(e) => {
                 state.error = Some(e.into());
                 let _ = state_tx.send(state.clone());
                 return false;
             }
-            Ok(bytes) => bytes,
         };
 
         // Determine the range of these bytes in the complete file
-        let byte_range = offset..offset + bytes.len() as u64;
+        let byte_range = pr.start_position..pr.start_position + bytes.len() as u64;
 
         // Update the offset
-        offset = byte_range.end;
+        pr.start_position = byte_range.end;
 
-        // Copy the data from the stream to memory
-        memory_map[byte_range.start as usize..byte_range.end as usize]
-            .copy_from_slice(bytes.as_ref());
-
-        // Update the range of bytes that have been downloaded
-        state.resident_range.update(byte_range);
+        memory_update(memory_map, state, start_position, &bytes, byte_range);
 
         // Notify anyone that's listening that we have downloaded some extra data
         if state_tx.send(state.clone()).is_err() {
@@ -550,8 +600,42 @@ async fn stream_response(
             return false;
         }
     }
-
     true
+}
+
+/// We update the memory map with the new data and remove some of the old data if we reached limits
+fn memory_update(
+    memory_map: &mut MmapMut,
+    state: &mut StreamerState,
+    ref_position: u64,
+    bytes: &[u8],
+    byte_range: Range<u64>,
+) {
+    let end_offset = byte_range.end;
+
+    // Copy the data from the stream to memory
+    memory_map[byte_range.start as usize..byte_range.end as usize].copy_from_slice(bytes.as_ref());
+
+    // Update the range of bytes that have been downloaded
+    state.resident_range.update(byte_range);
+
+    // free memory if we are over the limit
+    let protect_zone = ref_position.saturating_sub(state.backward_memory_limit)..end_offset;
+    if let Some((new_resident_range, ranges_to_remove)) =
+        state.resident_range.uncover_except(protect_zone)
+    {
+        state.resident_range = new_resident_range;
+        for range_to_remove in ranges_to_remove {
+            memory_map
+                .unchecked_advise_range(
+                    // memmap2::UncheckedAdvice::DontNeed,
+                    memmap2::UncheckedAdvice::Free,
+                    *range_to_remove.start() as usize,
+                    range_to_remove.count(),
+                )
+                .expect("Failed to remove memory range");
+        }
+    }
 }
 
 impl AsyncSeek for AsyncHttpRangeReader {
@@ -585,7 +669,7 @@ impl AsyncRead for AsyncHttpRangeReader {
 
         // If a previous error occurred we return that.
         if let Some(e) = inner.streamer_state.error.as_ref() {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.clone())));
+            return Poll::Ready(Err(io::Error::other(e.clone())));
         }
 
         // Determine the range to be fetched
@@ -639,9 +723,10 @@ impl AsyncRead for AsyncHttpRangeReader {
             match ready!(Pin::new(&mut inner.streamer_state_rx).poll_next(cx)) {
                 None => unreachable!(),
                 Some(state) => {
+                    inner.requested_range = state.requested_ranges.clone();
                     inner.streamer_state = state;
                     if let Some(e) = inner.streamer_state.error.as_ref() {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.clone())));
+                        return Poll::Ready(Err(io::Error::other(e.clone())));
                     }
                 }
             }
@@ -727,7 +812,13 @@ mod test {
             .get_mut()
             .requested_ranges()
             .await;
-        assert_eq!(request_ranges.len(), 1);
+        let requested_time = reader
+            .inner_mut()
+            .get_mut()
+            .get_mut()
+            .requested_time()
+            .await;
+        assert_eq!(requested_time, 1);
         assert_eq!(
             request_ranges[0].end - request_ranges[0].start,
             8192,
@@ -778,8 +869,9 @@ mod test {
 
         assert_eq!(contents, r#"{"conda_pkg_format_version": 2}"#);
         assert_eq!(request_ranges.len(), 2);
+
         assert_eq!(
-            request_ranges[1],
+            request_ranges[0],
             0..size,
             "expected only two range requests"
         );
