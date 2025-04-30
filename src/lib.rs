@@ -30,17 +30,18 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::Arc,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 use tokio::{
     io::{AsyncRead, AsyncSeek, ReadBuf},
     sync::watch::Sender,
-    sync::{watch, Mutex},
+    sync::{Mutex, watch},
 };
 use tokio_stream::wrappers::WatchStream;
+use tracing::*;
 // use tokio_util::bytes;
 use tokio_util::sync::PollSender;
-use tracing::{info_span, Instrument};
+use tracing::{Instrument, info, info_span};
 
 pub use error::AsyncHttpRangeReaderError;
 
@@ -503,6 +504,7 @@ async fn run_streamer(
         // Download and stream each range.
         for range in uncovered_ranges {
             // Update the requested ranges
+            debug!(?range, "Updating uncovered requested ranges");
             state
                 .requested_ranges
                 .update(*range.start()..*range.end() + 1);
@@ -515,8 +517,8 @@ async fn run_streamer(
             {
                 state.requested_time += 1;
                 // Create a new request
-                // let range_string = format!("bytes={}-{}", range.start(), range.end());
                 let range_string = format!("bytes={}-", range.start());
+                info!(%range_string, "Requesting new range");
                 let span = info_span!("fetch_range", range = range_string.as_str());
                 let response = match client
                     .get(url.clone())
@@ -538,8 +540,14 @@ async fn run_streamer(
 
                 // If the server returns a successful, but non-206 response (e.g., 200), then it
                 // doesn't support range requests (even if the `Accept-Ranges` header is set).
-                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                // except for the case where the range is "bytes=0-". Server will return 200 OK
+                if *range.start() != 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+                {
                     state.error = Some(AsyncHttpRangeReaderError::HttpRangeRequestUnsupported);
+                    error!(
+                        status = %response.status(),
+                        "Server does not support range requests."
+                    );
                     let _ = state_tx.send(state);
                     break 'outer;
                 }
@@ -560,6 +568,12 @@ async fn run_streamer(
     }
 }
 
+#[tracing::instrument(
+    name = "stream_response",
+    level = "debug",
+    skip_all,
+    fields(position_response, target_end)
+)]
 /// Streams the data from the specified response to the memory map updating progress in between.
 /// Reads from position `position_response.pos` until `target_end` is reached.
 /// `pos` can be larger than `target_end` if the server returns a chunk has more data than needed.
@@ -567,14 +581,15 @@ async fn run_streamer(
 /// is stored in `state_tx` so the "frontend" will consume it.
 async fn stream_response(
     position_response: &mut PositionResponse,
-    target_end: u64,
+    inclusive_target_end: u64,
     memory_map: &mut MmapMut,
     state_tx: &mut Sender<StreamerState>,
     state: &mut StreamerState,
 ) -> bool {
     let pr = position_response;
-    let start_position = pr.start_position;
-    while pr.start_position < target_end {
+    let initial_position = pr.start_position;
+
+    while pr.start_position <= inclusive_target_end {
         let bytes = match pr.response.chunk().await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
@@ -591,7 +606,13 @@ async fn stream_response(
         // Update the offset
         pr.start_position = byte_range.end;
 
-        memory_update(memory_map, state, start_position, &bytes, byte_range);
+        debug!(
+            "Downloaded {} bytes from {} to {}",
+            bytes.len(),
+            byte_range.start,
+            byte_range.end
+        );
+        memory_update(memory_map, state, initial_position, &bytes, byte_range);
 
         // Notify anyone that's listening that we have downloaded some extra data
         if state_tx.send(state.clone()).is_err() {
@@ -603,6 +624,11 @@ async fn stream_response(
     true
 }
 
+#[tracing::instrument(
+    name = "memory_update",
+    skip_all,
+    fields(bytes_range, bytes_len = bytes.len())
+)]
 /// We update the memory map with the new data and remove some of the old data if we reached limits
 fn memory_update(
     memory_map: &mut MmapMut,
