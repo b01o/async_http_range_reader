@@ -157,13 +157,7 @@ impl SparseRange {
             new_left.splice(left_index..right_index, [start]);
             let mut new_right = self.right.clone();
             new_right.splice(left_index..right_index, [end]);
-            Some((
-                Self {
-                    left: new_left,
-                    right: new_right,
-                },
-                ranges,
-            ))
+            Some((Self { left: new_left, right: new_right }, ranges))
         }
     }
 
@@ -236,13 +230,7 @@ impl SparseRange {
         if ranges.is_empty() {
             None
         } else {
-            Some((
-                Self {
-                    left: new_left,
-                    right: new_right,
-                },
-                ranges,
-            ))
+            Some((Self { left: new_left, right: new_right }, ranges))
         }
     }
 
@@ -287,13 +275,7 @@ impl SparseRange {
         if ranges.is_empty() {
             None
         } else {
-            Some((
-                Self {
-                    left: new_left,
-                    right: new_right,
-                },
-                ranges,
-            ))
+            Some((Self { left: new_left, right: new_right }, ranges))
         }
     }
 }

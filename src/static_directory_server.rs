@@ -48,10 +48,7 @@ impl StaticDirectoryServer {
                 .await;
         });
 
-        Ok(Self {
-            local_addr: addr,
-            shutdown_sender: Some(tx),
-        })
+        Ok(Self { local_addr: addr, shutdown_sender: Some(tx) })
     }
 }
 
